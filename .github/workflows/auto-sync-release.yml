@@ -1,0 +1,183 @@
+# Mirror turtleisaac/Nds4j to this independent repository.
+# Releases are GitHub-only snapshots; upstream v* tags and Maven Central are untouched.
+name: Sync upstream and publish snapshots
+
+on:
+  schedule:
+    - cron: '11,41 * * * *'
+  workflow_dispatch:
+    inputs:
+      release_current:
+        description: 'Build and release the current upstream commit even if already synchronized'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nds4j-upstream-sync-and-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == '969981/Nds4j'
+    name: Fetch and sync upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      commit: ${{ steps.sync.outputs.commit }}
+      upstream: ${{ steps.sync.outputs.upstream }}
+      tag: ${{ steps.sync.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - id: sync
+        name: Merge new upstream commits (never force-push)
+        shell: bash
+        env:
+          FORCE_RELEASE: ${{ inputs.release_current || 'false' }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/turtleisaac/Nds4j.git
+          git fetch --no-tags upstream main
+          upstream_sha=$(git rev-parse upstream/main)
+          changed=false
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            # Preserve local commits, workflows and unrelated branches. On a merge
+            # conflict, stop and report it instead of silently replacing local code.
+            git merge --no-ff -m "chore(sync): upstream $upstream_sha" upstream/main
+            git push origin HEAD:main
+            changed=true
+          fi
+          if [[ "$changed" == "false" && "$FORCE_RELEASE" != "true" ]]; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo "No upstream change since $upstream_sha; no build or release."
+            exit 0
+          fi
+          commit=$(git rev-parse HEAD)
+          {
+            echo 'changed=true'
+            echo "commit=$commit"
+            echo "upstream=$upstream_sha"
+            echo "tag=sync-${upstream_sha:0:12}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Mirror commit: $commit; upstream commit: $upstream_sha"
+
+  test:
+    name: Test on JDK ${{ matrix.java }}
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['17', '21']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.commit }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Verify the Java library
+        run: mvn -B -ntp verify
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-jdk${{ matrix.java }}
+          path: '**/target/surefire-reports/**'
+          if-no-files-found: ignore
+
+  release:
+    name: Build JAR and publish GitHub Release
+    needs: [sync, test]
+    if: needs.sync.outputs.changed == 'true' && needs.test.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.commit }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Check whether this upstream revision has already been published
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists: skipping."
+          else
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Compile and assemble the JAR (without deploy)
+        if: steps.published.outputs.exists == 'false'
+        run: mvn -B -ntp -DskipTests package
+      - name: Prepare SHA256 checksums and release notes
+        if: steps.published.outputs.exists == 'false'
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream }}
+          MIRROR_SHA: ${{ needs.sync.outputs.commit }}
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          jars=(target/*.jar)
+          if (( ${#jars[@]} != 1 )); then
+            echo "::error::Expected exactly one built JAR, found ${#jars[@]}"
+            exit 1
+          fi
+          cp "${jars[0]}" dist/
+          cp pom.xml LICENSE dist/
+          (cd dist && sha256sum *.jar pom.xml LICENSE > SHA256SUMS)
+          cat > release-notes.md <<EOF
+          Automated Nds4j snapshot compiled and tested from [turtleisaac/Nds4j](https://github.com/turtleisaac/Nds4j).
+
+          - Upstream commit: $UPSTREAM_SHA
+          - Mirror build commit: $MIRROR_SHA
+          - Tests: Maven verify on JDK 17 and JDK 21
+          - Build: Maven package on JDK 17
+          - Assets: JAR, pom.xml, GPL license and SHA256SUMS
+          - CI run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          This is a GitHub prerelease snapshot, not a Maven Central release.
+          No real game ROMs are bundled; ROM-dependent tests skip without fixtures.
+          EOF
+          cat dist/SHA256SUMS
+
+      - name: Publish snapshot once (never to Maven Central)
+        if: steps.published.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream }}
+          MIRROR_SHA: ${{ needs.sync.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$MIRROR_SHA" \
+            --title "Nds4j upstream ${UPSTREAM_SHA:0:12}" \
+            --notes-file release-notes.md \
+            --prerelease
