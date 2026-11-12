@@ -45,7 +45,7 @@ jobs:
         name: Merge new upstream commits (never force-push)
         shell: bash
         env:
-          FORCE_RELEASE: ${{ inputs.release_current || 'false' }}
+          FORCE_RELEASE: ${{ inputs.release_current || github.event_name == 'push' }}
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/turtleisaac/Nds4j.git
