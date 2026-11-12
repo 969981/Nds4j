@@ -5,6 +5,9 @@ name: Sync upstream and publish snapshots
 on:
   schedule:
     - cron: '11,41 * * * *'
+  push:
+    branches: [main]
+    paths: ['.github/workflows/auto-sync-release.yml']
   workflow_dispatch:
     inputs:
       release_current:
@@ -49,14 +52,25 @@ jobs:
           git fetch --no-tags upstream main
           upstream_sha=$(git rev-parse upstream/main)
           changed=false
-          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            # Preserve local commits, workflows and unrelated branches. On a merge
-            # conflict, stop and report it instead of silently replacing local code.
-            git merge --no-ff -m "chore(sync): upstream $upstream_sha" upstream/main
-            git push origin HEAD:main
-            changed=true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Never import upstream workflow commits into the GitHub App push:
+          # this token has contents:write, but not workflows write permission.
+          # Apply only the upstream source delta, preserving local commits.
+          baseline=$(git log -1 --format=%B --grep='Upstream-Commit:' | sed -nE 's/^Upstream-Commit: ([0-9a-f]{40})$/\1/p' | head -1)
+          if [[ -z "$baseline" ]]; then
+            baseline=$(git merge-base HEAD upstream/main)
+          fi
+          [[ "$baseline" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Could not find a trusted upstream merge base"; exit 1; }
+          patch="$RUNNER_TEMP/nds4j-upstream-source.patch"
+          git diff --binary "$baseline" upstream/main -- . ':(exclude).github/workflows/**' > "$patch"
+          if [[ -s "$patch" ]]; then
+            git apply --3way --index "$patch"
+            if ! git diff --cached --quiet; then
+              git commit -m "chore(sync): upstream source $upstream_sha" -m "Upstream-Commit: $upstream_sha"
+              git push origin HEAD:main
+              changed=true
+            fi
           fi
           if [[ "$changed" == "false" && "$FORCE_RELEASE" != "true" ]]; then
             echo 'changed=false' >> "$GITHUB_OUTPUT"
