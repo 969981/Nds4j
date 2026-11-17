@@ -837,6 +837,66 @@ public class CellBank extends GenericNtrFile
         return mappingType;
     }
 
+    /** Byte offset of a 1D OAM character name. The name counts in CEBK boundary steps, for 4bpp and 8bpp. */
+    static int tileByteOffset(int tileOffset, int mappingType, int partitionOffset)
+    {
+        return (tileOffset << mappingType) * 32 + partitionOffset;
+    }
+
+    /** Column of a 2D character name, in 8x8 tiles. An 8bpp name counts two numbers per tile. */
+    static int gridColumn(int tileOffset, int bitDepth)
+    {
+        return (gridName(tileOffset, bitDepth) % 32) / gridStep(bitDepth);
+    }
+
+    /** Row of a 2D character name. Each row is 32 character names. */
+    static int gridRow(int tileOffset, int bitDepth)
+    {
+        return gridName(tileOffset, bitDepth) / 32;
+    }
+
+    /** Column where this object starts, including a VRAM-transfer partition. */
+    static int gridSourceColumn(int tileOffset, int bitDepth, int partitionOffset, int tilesWide)
+    {
+        return gridColumn(tileOffset, bitDepth) + partitionTiles(bitDepth, partitionOffset) % tilesWide;
+    }
+
+    /** Row where this object starts, including a VRAM-transfer partition. */
+    static int gridSourceRow(int tileOffset, int bitDepth, int partitionOffset, int tilesWide)
+    {
+        return gridRow(tileOffset, bitDepth) + partitionTiles(bitDepth, partitionOffset) / tilesWide;
+    }
+
+    /** Returns the character name, clearing the low bit at 8bpp. */
+    private static int gridName(int tileOffset, int bitDepth)
+    {
+        if (bitDepth == 8)
+            return tileOffset & ~1;
+
+        return tileOffset;
+    }
+
+    /** Returns how many character names one 8x8 tile occupies. */
+    private static int gridStep(int bitDepth)
+    {
+        if (bitDepth == 8)
+            return 2;
+
+        return 1;
+    }
+
+    /** Returns the tile count covered by a VRAM-transfer partition. */
+    private static int partitionTiles(int bitDepth, int partitionOffset)
+    {
+        return partitionOffset / tileBytes(bitDepth);
+    }
+
+    /** @return the bytes in one 8x8 tile at this depth */
+    static int tileBytes(int bitDepth)
+    {
+        return gridStep(bitDepth) * 32;
+    }
+
     /**
      * Gets the cell at index <code>i</code>.
      * @param i the index of the cell
@@ -1309,62 +1369,141 @@ public class CellBank extends GenericNtrFile
 
                 private void generateImageData()
                 {
-                    if (oamSize[shape][size][0] != storedWidth || oamSize[shape][size][1] != storedHeight)
-                    {
-                        storedHeight = oamSize[shape][size][1];
-                        storedWidth = oamSize[shape][size][0];
-                        oamImage = new IndexedImage(storedHeight, storedWidth, image.getBitDepth(), image.getPalette());
-                    }
-
-                    // Color this OAM through its own 16-color sub-palette (4bpp): the OAM's `palette`
-                    // field selects which block of the NCLR to draw with. Without this every OAM would
-                    // draw with sub-palette 0, mis-coloring any sprite whose OAMs use palette != 0.
-                    int subCount = Math.max(1, image.getPalette().getNumColors() / 16);
-                    oamImage.setPaletteIdx(image.getBitDepth() == 4 && palette >= 0 && palette < subCount ? palette : 0);
-
+                    ensureOamCanvas();
+                    selectSubPalette();
                     if (image.getScanMode() == IndexedImage.NcgrUtils.ScanMode.LINE_BUFFER)
-                    {
-                        // The parent NCGR is a plain linear-raster sheet (a Gen V "pokegra" battle-sprite
-                        // sheet), not a bank of independently-addressable tile blocks. A tile index here
-                        // names a position in the sheet's own tile grid — tileOffset % sheetTilesWide,
-                        // tileOffset / sheetTilesWide — and the OAM is a rectangular crop of that grid
-                        // starting there, not a run of consecutive tiles. (Verified against a real part:
-                        // the crop this produces for a Bulbasaur head OAM is pixel-exact.)
-                        int sheetTilesWide = Math.max(1, image.getWidth() / 8);
-                        int srcX = (tileOffset % sheetTilesWide) * 8;
-                        int srcY = (tileOffset / sheetTilesWide) * 8;
-                        for (int row = 0; row < storedHeight; row++)
-                        {
-                            int sy = srcY + row;
-                            if (sy >= image.getHeight())
-                                break;
-                            for (int col = 0; col < storedWidth; col++)
-                            {
-                                int sx = srcX + col;
-                                if (sx >= image.getWidth())
-                                    break;
-                                oamImage.setPixelValue(col, row, image.getPixelValue(sx, sy));
-                            }
-                        }
-                    }
+                        copyLineBufferSheet();
                     else
-                    {
-                        int startByte = (tileOffset << (byte) mappingType) * (image.getBitDepth() * 8) + partitionOffset;
-                        byte[] imageData;
+                        copyTiledSprite();
 
-                        switch (oamImage.getBitDepth())
-                        {
-                            case 4:
-                                imageData = IndexedImage.NcgrUtils.convertToTiles4Bpp(image);
-                                IndexedImage.NcgrUtils.convertFromTiles4Bpp(imageData, oamImage, startByte);
-                                break;
-                            case 8:
-                                imageData = IndexedImage.NcgrUtils.convertToTiles8Bpp(image);
-                                IndexedImage.NcgrUtils.convertFromTiles8Bpp(imageData, oamImage, startByte);
-                                break;
-                        }
-                    }
                     update = false;
+                }
+
+                /** Allocates the OAM canvas when its shape or size has changed. */
+                private void ensureOamCanvas()
+                {
+                    if (canvasMatches())
+                        return;
+
+                    storedHeight = oamSize[shape][size][1];
+                    storedWidth = oamSize[shape][size][0];
+                    oamImage = new IndexedImage(storedHeight, storedWidth, image.getBitDepth(), image.getPalette());
+                }
+
+                /** @return whether the canvas already has this OAM's pixel size */
+                private boolean canvasMatches()
+                {
+                    return oamSize[shape][size][0] == storedWidth && oamSize[shape][size][1] == storedHeight;
+                }
+
+                /** Selects the 4bpp sub-palette this OAM draws with. 8bpp keeps sub-palette 0. */
+                private void selectSubPalette()
+                {
+                    int subCount = Math.max(1, image.getPalette().getNumColors() / 16);
+                    oamImage.setPaletteIdx(subPaletteIndex(subCount));
+                }
+
+                /** @return the NCLR block this OAM uses, or 0 when it has no block of its own */
+                private int subPaletteIndex(int subCount)
+                {
+                    if (fourBitPalette(subCount))
+                        return palette;
+
+                    return 0;
+                }
+
+                /** @return whether this 4bpp OAM's palette number names a block the NCLR actually has */
+                private boolean fourBitPalette(int subCount)
+                {
+                    return image.getBitDepth() == 4 && paletteInside(subCount);
+                }
+
+                /** @return whether the palette number falls inside the NCLR's 16-color blocks */
+                private boolean paletteInside(int subCount)
+                {
+                    return palette >= 0 && palette < subCount;
+                }
+
+                /** Crops a linear-raster NCGR at this OAM's cell in the sheet grid. */
+                private void copyLineBufferSheet()
+                {
+                    int sheetTilesWide = Math.max(1, image.getWidth() / 8);
+                    int srcX = (tileOffset % sheetTilesWide) * 8;
+                    int srcY = (tileOffset / sheetTilesWide) * 8;
+                    for (int row = 0; row < storedHeight; row++)
+                        copyLineBufferRow(srcX, srcY, row);
+                }
+
+                /** Copies one row of the sheet crop, stopping once the row is off the sheet. */
+                private void copyLineBufferRow(int srcX, int srcY, int row)
+                {
+                    int sy = srcY + row;
+                    if (sy >= image.getHeight())
+                        return;
+
+                    copyLineBufferColumns(srcX, sy, row);
+                }
+
+                /** Copies the columns of one sheet-crop row. */
+                private void copyLineBufferColumns(int srcX, int sy, int row)
+                {
+                    for (int col = 0; col < storedWidth; col++)
+                        copyLineBufferPixel(srcX, sy, col, row);
+                }
+
+                /** Copies one sheet pixel, stopping once the column is off the sheet. */
+                private void copyLineBufferPixel(int srcX, int sy, int col, int row)
+                {
+                    int sx = srcX + col;
+                    if (sx >= image.getWidth())
+                        return;
+
+                    oamImage.setPixelValue(col, row, image.getPixelValue(sx, sy));
+                }
+
+                /** Reads this OAM's tiles from the NCGR at its character-name offset. */
+                private void copyTiledSprite()
+                {
+                    if (mappingType == 4)
+                        copyGridSprite();
+                    else
+                        copyLinearSprite();
+                }
+
+                /** Reads a 1D object as a consecutive run of tiles. */
+                private void copyLinearSprite()
+                {
+                    byte[] imageData = tilesOf(image);
+                    int startByte = tileByteOffset(tileOffset, mappingType, partitionOffset);
+                    decodeTiles(imageData, oamImage, startByte);
+                }
+
+                /** Reads a 2D object as a rectangle on the sheet. Rows are 32 character names apart. */
+                private void copyGridSprite()
+                {
+                    int wide = Math.max(1, image.getWidth() / 8);
+                    int srcX = gridSourceColumn(tileOffset, image.getBitDepth(), partitionOffset, wide) * 8;
+                    int srcY = gridSourceRow(tileOffset, image.getBitDepth(), partitionOffset, wide) * 8;
+                    for (int row = 0; row < storedHeight; row++)
+                        copyLineBufferRow(srcX, srcY, row);
+                }
+
+                /** @return the image packed as 4bpp or 8bpp character tiles */
+                private byte[] tilesOf(IndexedImage source)
+                {
+                    if (source.getBitDepth() == 8)
+                        return IndexedImage.NcgrUtils.convertToTiles8Bpp(source);
+
+                    return IndexedImage.NcgrUtils.convertToTiles4Bpp(source);
+                }
+
+                /** Unpacks character tiles into <code>dest</code> starting at <code>startByte</code>. */
+                private void decodeTiles(byte[] imageData, IndexedImage dest, int startByte)
+                {
+                    if (dest.getBitDepth() == 8)
+                        IndexedImage.NcgrUtils.convertFromTiles8Bpp(imageData, dest, startByte);
+                    else
+                        IndexedImage.NcgrUtils.convertFromTiles4Bpp(imageData, dest, startByte);
                 }
 
                 /**
@@ -1381,36 +1520,64 @@ public class CellBank extends GenericNtrFile
                     if (image.getScanMode() == IndexedImage.NcgrUtils.ScanMode.LINE_BUFFER)
                         throw new RuntimeException("Editing a LINE_BUFFER (bitmap-sheet) NCGR's OAMs isn't supported yet");
 
+                    saveTiles();
+                }
+
+                /** Writes this object back into the NCGR, as a rectangle for 2D mapping and a run for 1D. */
+                private void saveTiles()
+                {
+                    if (mappingType == 4)
+                    {
+                        saveGridSprite();
+                        return;
+                    }
+
+                    saveLinearSprite();
+                }
+
+                /** Writes a 1D object back as a consecutive run of tiles. */
+                private void saveLinearSprite()
+                {
                     oamImage.setBitDepth(image.getBitDepth());
-
-                    byte[] cellData = new byte[0];
-                    byte[] imageData = new byte[0];
-                    switch (image.getBitDepth())
-                    {
-                        case 4:
-                            cellData = IndexedImage.NcgrUtils.convertToTiles4Bpp(oamImage);
-                            imageData = IndexedImage.NcgrUtils.convertToTiles4Bpp(image);
-                            break;
-                        case 8:
-                            cellData = IndexedImage.NcgrUtils.convertToTiles8Bpp(oamImage);
-                            imageData = IndexedImage.NcgrUtils.convertToTiles8Bpp(image);
-                            break;
-                    }
-
-
-                    int startByte = (tileOffset << (byte) mappingType) * (image.getBitDepth() * 8) + partitionOffset;
-
+                    byte[] cellData = tilesOf(oamImage);
+                    byte[] imageData = tilesOf(image);
+                    int startByte = tileByteOffset(tileOffset, mappingType, partitionOffset);
                     System.arraycopy(cellData, 0, imageData, startByte, cellData.length);
+                    decodeTiles(imageData, image, 0);
+                }
 
-                    switch (image.getBitDepth())
-                    {
-                        case 4:
-                            IndexedImage.NcgrUtils.convertFromTiles4Bpp(imageData, image, 0);
-                            break;
-                        case 8:
-                            IndexedImage.NcgrUtils.convertFromTiles8Bpp(imageData, image, 0);
-                            break;
-                    }
+                /** Writes a 2D object back onto its rectangle of the sheet. */
+                private void saveGridSprite()
+                {
+                    byte[] cellData = tilesOf(oamImage);
+                    byte[] imageData = tilesOf(image);
+                    int wide = Math.max(1, image.getWidth() / 8);
+                    int cols = storedWidth / 8;
+                    int bytes = tileBytes(image.getBitDepth());
+                    for (int row = 0; row < storedHeight / 8; row++)
+                        saveGridTileRow(cellData, imageData, wide, cols, bytes, row);
+
+                    decodeTiles(imageData, image, 0);
+                }
+
+                /** Writes one tile row of a 2D object into the sheet. */
+                private void saveGridTileRow(byte[] cellData, byte[] imageData, int wide, int cols, int bytes, int row)
+                {
+                    for (int col = 0; col < cols; col++)
+                        saveGridTile(cellData, imageData, wide, cols, bytes, col, row);
+                }
+
+                /** Writes one 8x8 of a 2D object, skipping a tile that leaves the sheet. */
+                private void saveGridTile(byte[] cellData, byte[] imageData, int wide, int cols, int bytes, int col, int row)
+                {
+                    int fileCol = gridSourceColumn(tileOffset, image.getBitDepth(), partitionOffset, wide) + col;
+                    int fileRow = gridSourceRow(tileOffset, image.getBitDepth(), partitionOffset, wide) + row;
+                    if (fileCol >= wide || fileRow >= image.getHeight() / 8)
+                        return;
+
+                    int from = (row * cols + col) * bytes;
+                    int to = (fileRow * wide + fileCol) * bytes;
+                    System.arraycopy(cellData, from, imageData, to, bytes);
                 }
 
                 /**
